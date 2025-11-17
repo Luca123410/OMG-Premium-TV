@@ -10,25 +10,29 @@ class PythonResolver {
     constructor() {
         this.scriptPath = path.join(__dirname, 'resolver_script.py');
         this.resolvedLinksCache = new Map();
-        this.cacheExpiryTime = 20 * 60 * 1000; // 20 minuti di cache per i link risolti
+        // --- NUOVA BOMBA #2: Prevenzione "Dog-Piling" ---
+        this.pendingRequests = new Map(); // Mappa per le richieste in attesa
+        // --- FINE BOMBA #2 ---
+        this.cacheExpiryTime = 20 * 60 * 1000; // 20 minuti
         this.lastExecution = null;
         this.lastError = null;
-        this.isRunning = false;
+        this.isRunning = false; // Mantenuto per logica di fallback
         this.scriptUrl = null;
         this.cronJob = null;
         this.updateInterval = null;
         this.pythonCmd = process.platform === 'win32' ? 'python' : 'python3';
         
-        // Crea la directory temp se non esiste
+        // La cartella temp non serve più per l'IPC, ma la lasciamo
+        // nel caso l'utente carichi altri script che ne hanno bisogno.
         if (!fs.existsSync(path.join(__dirname, 'temp'))) {
             fs.mkdirSync(path.join(__dirname, 'temp'));
         }
     }
 
     /**
-     * Scarica lo script Python resolver dall'URL fornito
+     * Scarica lo script Python e installa le sue dipendenze
      * @param {string} url - L'URL dello script Python
-     * @returns {Promise<boolean>} - true se il download è avvenuto con successo
+     * @returns {Promise<boolean>} - true se successo
      */
     async downloadScript(url) {
         try {
@@ -36,14 +40,37 @@ class PythonResolver {
             this.scriptUrl = url;
             
             const response = await axios.get(url, { responseType: 'text' });
-            fs.writeFileSync(this.scriptPath, response.data);
+            const scriptContent = response.data;
+            fs.writeFileSync(this.scriptPath, scriptContent);
             
-            // Verifica che lo script contenga la funzione resolve_link
-            if (!response.data.includes('def resolve_link') && !response.data.includes('def resolve_stream')) {
+            if (!scriptContent.includes('def resolve_link') && !scriptContent.includes('def resolve_stream')) {
                 this.lastError = 'Lo script deve contenere una funzione resolve_link o resolve_stream';
                 console.error(`❌ ${this.lastError}`);
                 return false;
             }
+
+            // --- NUOVA BOMBA #3: Auto-Installazione Dipendenze ---
+            console.log('Verifica dipendenze Python richieste dallo script...');
+            const reqMatch = scriptContent.match(/#\s*REQUIREMENTS:\s*(.+)/i);
+            if (reqMatch && reqMatch[1]) {
+                const dependencies = reqMatch[1].split(',').map(d => d.trim()).filter(Boolean);
+                if (dependencies.length > 0) {
+                    console.log(`Trovate dipendenze: ${dependencies.join(', ')}. Installazione in corso...`);
+                    const installCmd = `${this.pythonCmd} -m pip install -q ${dependencies.join(' ')} --break-system-packages`;
+                    
+                    try {
+                        await execAsync(installCmd);
+                        console.log('✓ Dipendenze Python installate con successo.');
+                    } catch (pipError) {
+                        console.error(`❌ Errore installazione dipendenze Python: ${pipError.message}`);
+                        this.lastError = `Errore pip: ${pipError.message}`;
+                        return false; // Fallisce se le dipendenze non possono essere installate
+                    }
+                }
+            } else {
+                console.log('Nessuna dipendenza extra richiesta dallo script.');
+            }
+            // --- FINE BOMBA #3 ---
             
             return true;
         } catch (error) {
@@ -53,28 +80,19 @@ class PythonResolver {
         }
     }
 
-    /**
-     * Verifica la salute dello script resolver
-     * @returns {Promise<boolean>} - true se lo script è valido
-     */
     async checkScriptHealth() {
+        // (Invariato, è già ottimo)
         if (!fs.existsSync(this.scriptPath)) {
             console.error('❌ Script Python resolver non trovato');
             this.lastError = 'Script Python resolver non trovato';
             return false;
         }
-
         try {
-            // Verifica che Python sia installato
             await execAsync(`${this.pythonCmd} --version`);
-            
-            // Esegui lo script con il parametro --check per verificare la validità
             const { stdout, stderr } = await execAsync(`${this.pythonCmd} ${this.scriptPath} --check`);
-            
             if (stderr && !stderr.includes('resolver_ready')) {
                 console.warn('⚠️ Warning durante la verifica dello script:', stderr);
             }
-            
             return stdout.includes('resolver_ready') || stderr.includes('resolver_ready');
         } catch (error) {
             console.error('❌ Errore durante la verifica dello script resolver:', error.message);
@@ -83,9 +101,8 @@ class PythonResolver {
         }
     }
 
-
     /**
-     * Risolve un URL tramite lo script Python
+     * Risolve un URL tramite lo script Python usando IPC (stdin/stdout)
      * @param {string} url - L'URL da risolvere
      * @param {object} headers - Gli header da passare allo script
      * @param {string} channelName - Nome del canale (per logging)
@@ -93,7 +110,7 @@ class PythonResolver {
      * @returns {Promise<object>} - Oggetto con l'URL risolto e gli header
      */
     async resolveLink(url, headers = {}, channelName = 'unknown', proxyConfig = null) {
-        // Controllo della cache
+        // 1. Controllo Cache Veloce
         const cacheKey = `${url}:${JSON.stringify(headers)}`;
         const cachedResult = this.resolvedLinksCache.get(cacheKey);
         if (cachedResult && (Date.now() - cachedResult.timestamp) < this.cacheExpiryTime) {
@@ -101,48 +118,51 @@ class PythonResolver {
             return cachedResult.data;
         }
     
+        // --- MODIFICA BOMBA #2: "Request Coalescing" ---
+        // 2. Controllo Richieste in Attesa
+        // Se un'altra richiesta identica è già in corso, ci accodiamo
+        const pending = this.pendingRequests.get(cacheKey);
+        if (pending) {
+            console.log(`[Coalescing] Richiesta accodata per ${channelName}, in attesa...`);
+            return pending; // Ritorna la promise in attesa
+        }
+        // --- FINE BOMBA #2 ---
+
         if (!fs.existsSync(this.scriptPath)) {
             console.error('❌ Script Python resolver non trovato');
             this.lastError = 'Script Python resolver non trovato';
             return null;
         }
-    
-        if (this.isRunning) {
-            await new Promise(resolve => setTimeout(resolve, 500));
-        }
-    
-        try {
-            this.isRunning = true;
-            console.log(`\n=== Risoluzione URL per: ${channelName} ===`);
-    
-            // Crea un file temporaneo con i parametri di input
-            const inputParams = {
-                url: url,
-                headers: headers,
-                channel_name: channelName,
-                proxy_config: proxyConfig // Aggiungi la configurazione del proxy
-            };
-            
-            const inputFile = path.join(__dirname, 'temp', `input_${Date.now()}.json`);
-            const outputFile = path.join(__dirname, 'temp', `output_${Date.now()}.json`);
-            
-            fs.writeFileSync(inputFile, JSON.stringify(inputParams, null, 2));
-            
-            // Esegui lo script Python con i parametri
-            const cmd = `${this.pythonCmd} ${this.scriptPath} --resolve "${inputFile}" "${outputFile}"`;
-            
-            const { stdout, stderr } = await execAsync(cmd);
-            
-            if (stderr) {
-                console.warn('⚠️ Warning durante la risoluzione:', stderr);
-            }
-            
-            // Leggi il risultato
-            if (fs.existsSync(outputFile)) {
-                const resultText = fs.readFileSync(outputFile, 'utf8');
+
+        // 3. Crea la Promise di Esecuzione
+        const workPromise = (async () => {
+            try {
+                this.isRunning = true;
+                console.log(`\n=== [IPC] Risoluzione URL per: ${channelName} ===`);
+        
+                // --- MODIFICA BOMBA #1: RIMOZIONE FILE I/O ---
+                // Non scriviamo più file, passiamo i dati via stdin
+                const inputParams = {
+                    url: url,
+                    headers: headers,
+                    channel_name: channelName,
+                    proxy_config: proxyConfig
+                };
+                const inputString = JSON.stringify(inputParams);
+        
+                // Esegui lo script Python e passa i dati via stdin
+                const cmd = `${this.pythonCmd} ${this.scriptPath} --resolve-ipc`;
                 
+                // Passiamo 'inputString' come 'input' a execAsync
+                const { stdout, stderr } = await execAsync(cmd, { input: inputString });
+                
+                if (stderr) {
+                    console.warn(`⚠️ Warning durante la risoluzione (IPC): ${stderr}`);
+                }
+        
+                // Leggi il risultato direttamente da stdout
                 try {
-                    const result = JSON.parse(resultText);
+                    const result = JSON.parse(stdout);
                     
                     // Salva in cache
                     this.resolvedLinksCache.set(cacheKey, {
@@ -152,49 +172,44 @@ class PythonResolver {
                     
                     this.lastExecution = new Date();
                     this.lastError = null;
-                    console.log(`✓ URL risolto per ${channelName}`);
-    
-    
-                    // Elimina i file temporanei
-                    try {
-                        fs.unlinkSync(inputFile);
-                        fs.unlinkSync(outputFile);
-                    } catch (e) {
-                        console.error('Errore nella pulizia dei file temporanei:', e.message);
-                    }
+                    console.log(`✓ [IPC] URL risolto per ${channelName}`);
                     return result;
                     
                 } catch (parseError) {
-                    console.error('❌ Errore nel parsing del risultato:', parseError.message);
-                    console.error('Contenuto risultato:', resultText);
+                    console.error('❌ Errore nel parsing del risultato (IPC):', parseError.message);
+                    console.error('Contenuto stdout:', stdout);
                     this.lastError = `Errore parsing: ${parseError.message}`;
                     return null;
                 }
-            } else {
-                console.error('❌ File di output non creato');
-                this.lastError = 'File di output non creato';
+                // --- FINE BOMBA #1 ---
+        
+            } catch (error) {
+                console.error('❌ Errore durante la risoluzione URL (IPC):', error.message);
+                if (error.stderr) console.error('Stderr:', error.stderr);
+                this.lastError = `Errore esecuzione: ${error.message}`;
                 return null;
+            } finally {
+                this.isRunning = false;
+                // --- MODIFICA BOMBA #2: Rimuovi la promise in attesa ---
+                this.pendingRequests.delete(cacheKey);
+                // --- FINE BOMBA #2 ---
             }
-        } catch (error) {
-            console.error('❌ Errore durante la risoluzione URL:', error.message);
-            if (error.stderr) console.error('Stderr:', error.stderr);
-            this.lastError = `Errore esecuzione: ${error.message}`;
-            return null;
-        } finally {
-            this.isRunning = false;
-        }
+        })();
+
+        // --- MODIFICA BOMBA #2: Salva la promise in attesa ---
+        this.pendingRequests.set(cacheKey, workPromise);
+        // --- FINE BOMBA #2 ---
+        
+        return workPromise;
     }
 
     /**
-     * Imposta un aggiornamento automatico dello script con la pianificazione specificata
-     * @param {string} timeFormat - Formato orario "HH:MM" o "H:MM"
-     * @returns {boolean} - true se la pianificazione è stata impostata con successo
+     * Imposta un aggiornamento automatico
+     * (Invariato, ma con log migliorati)
      */
     scheduleUpdate(timeFormat) {
-        // Ferma eventuali pianificazioni esistenti
         this.stopScheduledUpdates();
         
-        // Validazione del formato orario
         if (!timeFormat || !/^\d{1,2}:\d{2}$/.test(timeFormat)) {
             console.error('❌ [RESOLVER] Formato orario non valido. Usa HH:MM o H:MM');
             this.lastError = 'Formato orario non valido. Usa HH:MM o H:MM';
@@ -202,7 +217,6 @@ class PythonResolver {
         }
         
         try {
-            // Estrai ore e minuti
             const [hours, minutes] = timeFormat.split(':').map(Number);
             
             if (hours < 0 || hours > 23 || minutes < 0 || minutes > 59) {
@@ -211,15 +225,11 @@ class PythonResolver {
                 return false;
             }
             
-            // Crea una pianificazione cron
             let cronExpression;
-            
             if (hours === 0) {
-                // Esegui ogni X minuti
                 cronExpression = `*/${minutes} * * * *`;
                 console.log(`✓ [RESOLVER] Pianificazione impostata: ogni ${minutes} minuti`);
             } else {
-                // Esegui ogni X ore
                 cronExpression = `${minutes} */${hours} * * *`;
                 console.log(`✓ [RESOLVER] Pianificazione impostata: ogni ${hours} ore e ${minutes} minuti`);
             }
@@ -229,12 +239,10 @@ class PythonResolver {
                 if (this.scriptUrl) {
                     await this.downloadScript(this.scriptUrl);
                 }
-                // Pulisci la cache dopo l'aggiornamento
                 this.resolvedLinksCache.clear();
             });
             
             this.updateInterval = timeFormat;
-            console.log(`✓ [RESOLVER] Aggiornamento automatico configurato: ${timeFormat}`);
             return true;
         } catch (error) {
             console.error('❌ [RESOLVER] Errore nella pianificazione:', error.message);
@@ -243,40 +251,37 @@ class PythonResolver {
         }
     }
     
-    /**
-     * Ferma gli aggiornamenti pianificati
-     */
     stopScheduledUpdates() {
         if (this.cronJob) {
             this.cronJob.stop();
             this.cronJob = null;
             this.updateInterval = null;
-            console.log('✓ Aggiornamento automatico fermato');
+            console.log('✓ [RESOLVER] Aggiornamento automatico fermato');
             return true;
         }
         return false;
     }
 
-    /**
-     * Pulisce la cache dei link risolti
-     */
     clearCache() {
         this.resolvedLinksCache.clear();
-        console.log('✓ Cache dei link risolti svuotata');
+        console.log('✓ [RESOLVER] Cache dei link risolti svuotata');
         return true;
     }
 
     /**
-     * Crea un esempio di script resolver
-     * @returns {Promise<boolean>} - true se il template è stato creato con successo
+     * Crea un esempio di script resolver (MODIFICATO PER BOMBA #1 e #3)
+     * @returns {Promise<boolean>} - true se il template è stato creato
      */
     async createScriptTemplate() {
         try {
+            // --- MODIFICATO: Aggiunta BOMBA #3 ---
             const templateContent = `#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 #
-# Python Resolver per OMG TV
-# Questo script riceve un URL e restituisce l'URL risolto
+# Python Resolver per OMG TV (Versione IPC - stdin/stdout)
+# REQUIREMENTS: requests
+#
+# Questo script riceve i dati da STDIN e restituisce il JSON a STDOUT
 
 import sys
 import json
@@ -288,36 +293,37 @@ from urllib.parse import urlparse, parse_qs
 # Configurazione globale
 API_KEY = "la_tua_api_key"
 API_SECRET = "il_tuo_secret"
-RESOLVER_VERSION = "1.0.0"
+RESOLVER_VERSION = "2.0-IPC" # Versione aggiornata
 
 def get_token():
     """
     Esempio di funzione per ottenere un token di autenticazione
     """
-    # Implementazione personalizzata per ottenere il token
-    # Questa è solo una simulazione
     token = f"token_{int(time.time())}"
     return token
 
-def resolve_link(url, headers=None, channel_name=None):
+def resolve_link(url, headers=None, channel_name=None, proxy_config=None):
     """
     Funzione principale che risolve un link
+    
     Parametri:
     - url: URL da risolvere
     - headers: dizionario con gli header HTTP da utilizzare 
     - channel_name: nome del canale per il logging
+    - proxy_config: dizionario con info proxy (opzionale)
     
     Restituisce:
     - Un dizionario con l'URL risolto e gli header da utilizzare
     """
-    print(f"Risoluzione URL: {url}")
-    print(f"Canale: {channel_name}")
+    # Usiamo sys.stderr per i log, così non "sporchiamo" stdout
+    print(f"Risoluzione URL: {url}", file=sys.stderr)
+    print(f"Canale: {channel_name}", file=sys.stderr)
     
-    # Parsing dell'URL per estrarre parametri
+    if proxy_config:
+        print(f"Uso proxy: {proxy_config.get('url')}", file=sys.stderr)
+
     parsed_url = urlparse(url)
     params = parse_qs(parsed_url.query)
-    
-    # Esempio: aggiungi un token all'URL
     token = get_token()
     
     # ESEMPIO 1: Aggiungi token a URL esistente
@@ -336,10 +342,10 @@ def resolve_link(url, headers=None, channel_name=None):
                 data = api_response.json()
                 resolved_url = data.get("stream_url", url)
             else:
-                print(f"Errore API: {api_response.status_code}")
+                print(f"Errore API: {api_response.status_code}", file=sys.stderr)
                 resolved_url = url
         except Exception as e:
-            print(f"Errore chiamata API: {str(e)}")
+            print(f"Errore chiamata API: {str(e)}", file=sys.stderr)
             resolved_url = url
     
     # Caso predefinito: restituisci l'URL originale
@@ -348,8 +354,6 @@ def resolve_link(url, headers=None, channel_name=None):
     
     # Aggiungi o modifica gli header
     final_headers = headers.copy() if headers else {}
-    
-    # Puoi aggiungere header specifici
     final_headers["User-Agent"] = final_headers.get("User-Agent", "Mozilla/5.0")
     final_headers["Authorization"] = f"Bearer {token}"
     
@@ -363,44 +367,36 @@ def main():
     """
     Funzione principale che gestisce i parametri di input
     """
-    # Verifica parametri di input
-    if len(sys.argv) < 2:
-        print("Utilizzo: python3 resolver.py [--check|--resolve input_file output_file]")
-        sys.exit(1)
-    
     # Comando check: verifica che lo script sia valido
-    if sys.argv[1] == "--check":
-        print("resolver_ready: True")
+    if len(sys.argv) > 1 and sys.argv[1] == "--check":
+        print("resolver_ready: True") # Scrive a stdout
         sys.exit(0)
     
-    # Comando resolve: risolvi un URL
-    if sys.argv[1] == "--resolve" and len(sys.argv) >= 4:
-        input_file = sys.argv[2]
-        output_file = sys.argv[3]
-        
+    # --- MODIFICATO: Logica IPC (BOMBA #1) ---
+    # Comando resolve-ipc: risolvi un URL da stdin
+    if len(sys.argv) > 1 and sys.argv[1] == "--resolve-ipc":
         try:
-            # Leggi i parametri di input
-            with open(input_file, 'r') as f:
-                input_data = json.load(f)
+            # Leggi i parametri di input da stdin
+            input_data = json.load(sys.stdin)
             
             url = input_data.get('url', '')
             headers = input_data.get('headers', {})
             channel_name = input_data.get('channel_name', 'unknown')
+            proxy_config = input_data.get('proxy_config', None)
             
             # Risolvi l'URL
-            result = resolve_link(url, headers, channel_name)
+            result = resolve_link(url, headers, channel_name, proxy_config)
             
-            # Scrivi il risultato
-            with open(output_file, 'w') as f:
-                json.dump(result, f, indent=2)
-            
-            print(f"URL risolto salvato in: {output_file}")
+            # Scrivi il risultato JSON su stdout
+            json.dump(result, sys.stdout, indent=2)
             sys.exit(0)
+            
         except Exception as e:
-            print(f"Errore: {str(e)}")
+            # Scrivi l'errore su stderr
+            print(f"Errore: {str(e)}", file=sys.stderr)
             sys.exit(1)
     
-    print("Comando non valido")
+    print("Comando non valido. Usa --check o --resolve-ipc", file=sys.stderr)
     sys.exit(1)
 
 if __name__ == "__main__":
@@ -408,7 +404,7 @@ if __name__ == "__main__":
 `;
             
             fs.writeFileSync(this.scriptPath, templateContent);
-            console.log('✓ Template dello script resolver creato con successo');
+            console.log('✓ Template dello script resolver (IPC) creato con successo');
             return true;
         } catch (error) {
             console.error('❌ Errore nella creazione del template:', error.message);
@@ -417,10 +413,6 @@ if __name__ == "__main__":
         }
     }
 
-    /**
-     * Restituisce lo stato attuale del resolver
-     * @returns {Object} - Lo stato attuale
-     */
     getStatus() {
         return {
             isRunning: this.isRunning,
@@ -431,13 +423,11 @@ if __name__ == "__main__":
             updateInterval: this.updateInterval,
             scheduledUpdates: this.cronJob !== null,
             cacheItems: this.resolvedLinksCache.size,
+            pendingRequests: this.pendingRequests.size, // Aggiunto per debug
             resolverVersion: this.getResolverVersion()
         };
     }
 
-    /**
-     * Ottiene la versione del resolver dallo script Python
-     */
     getResolverVersion() {
         try {
             if (fs.existsSync(this.scriptPath)) {
@@ -454,11 +444,6 @@ if __name__ == "__main__":
         }
     }
 
-    /**
-     * Formatta una data in formato italiano
-     * @param {Date} date - La data da formattare
-     * @returns {string} - La data formattata
-     */
     formatDate(date) {
         return date.toLocaleString('it-IT', {
             year: 'numeric',

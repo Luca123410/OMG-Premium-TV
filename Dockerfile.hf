@@ -12,7 +12,7 @@ RUN apt-get update && \
 WORKDIR /app
 
 # Clone the repository and checkout specified branch
-RUN git clone https://github.com/mccoy88f/OMG-Premium-TV.git . && \
+RUN git clone https://github.com/Luca123410/OMG-Premium-TV.git . && \
     git checkout ${BRANCH}
 
 # Install dependencies
@@ -22,8 +22,6 @@ RUN npm install
 RUN mkdir -p /app/temp && \
     chmod 777 /app/temp
 RUN chmod 777 /app
-
-
 
 # Expose the port (Hugging Face uses 7860)
 EXPOSE 7860

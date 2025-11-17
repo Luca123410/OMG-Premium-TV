@@ -42,17 +42,12 @@ class CacheManager extends EventEmitter {
 
         // --- MODIFICA BOMBA #1: Reloading Senza Interruzioni ---
         // Quando l'M3U cambia, ricarichiamo in background
-        // ma NON cancelliamo la cache esistente. L'utente continua
-        // a navigare i vecchi dati finché i nuovi non sono pronti.
+        // ma NON cancelliamo la cache esistente.
         if (hasM3UChanges) {
             console.log('Playlist M3U modificata, ricarico in background...');
-            // NON CANCELLIAMO LA CACHE
-            // this.cache.stremioData = null; // <-- RIMOSSO
-            // this.cache.m3uUrl = null; // <-- RIMOSSO
             
             if (this.config.m3u) {
                 // Avviamo la ricostruzione, ma non è necessario attenderla
-                // L'handler successivo userà la vecchia cache se questa è ancora in corso
                 this.rebuildCache(this.config.m3u, this.config);
             }
         }
@@ -60,7 +55,6 @@ class CacheManager extends EventEmitter {
 
         if (hasEPGChanges) {
             console.log('Configurazione EPG modificata, aggiorno solo EPG...');
-            // La logica EPG è gestita da EPGManager
         }
 
         if (hasOtherChanges) {
@@ -95,7 +89,6 @@ class CacheManager extends EventEmitter {
 
     // --- MODIFICA BOMBA #2: Normalizzazione "Fuzzy" ---
     // Rimuove TUTTI i caratteri non alfanumerici (inclusi . e _)
-    // Ora 'sky.sport.1' e 'SkySport1' diventeranno entrambi 'skysport1'
     normalizeId(id, removeSuffix = false) {
         let normalized = id?.toLowerCase().replace(/[^\w]/g, '').trim() || ''; // <-- MODIFICATO
         
@@ -154,12 +147,10 @@ class CacheManager extends EventEmitter {
 
         } catch (error) {
             // --- MODIFICA BOMBA #3: Cache Resiliente ---
-            // Se la ricostruzione fallisce (es. M3U offline), non facciamo crashare l'app
-            // e NON cancelliamo la vecchia cache. Ci riproveremo al prossimo polling.
             console.error('\n❌ ERRORE nella ricostruzione della cache:', error.message);
             console.log('ℹ️  Mantengo la cache precedente (stale) finché il problema non è risolto.');
             this.emit('cacheError', error);
-            // NON lanciare 'throw error' per non bloccare il processo
+            // NON lanciare 'throw error'
             // --- FINE MODIFICA BOMBA #3 ---
         } finally {
             // In ogni caso, sblocchiamo l'aggiornamento
@@ -192,8 +183,6 @@ class CacheManager extends EventEmitter {
                    normalizedName === normalizedSearchId; // Aggiunto controllo nome
         });
 
-        // La logica di fallback non è più necessaria perché il find principale
-        // ora controlla anche il nome.
         return channel;
     }
 
@@ -216,7 +205,7 @@ class CacheManager extends EventEmitter {
     
         return this.cache.stremioData.channels.filter(channel => {
             const normalizedName = this.normalizeId(channel.name);
-Attualmente, `package-lock.json` non è presente nei file. Vuoi che lo generi per te?
+            // *** QUI C'ERA L'ERRORE ***
             return normalizedName.includes(normalizedQuery);
         });
     }

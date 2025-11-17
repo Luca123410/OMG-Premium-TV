@@ -17,24 +17,32 @@ const baseConfig = {
         cacheExpiry: 12 * 60 * 60 * 1000
     },
     manifest: {
-        id: 'org.mccoy88f.omgtv',
-        version: '1.0.0',
-        name: 'OMG TV',
+        id: 'org.mccoy88f.omgtv', // Sarà sovrascritto da addon-config.json
+        version: '1.0.0', // Sarà sovrascritto
+        name: 'OMG TV', // Sarà sovrascritto
         description: 'Modalita provvisoria, installazione con errori, attivo mod. provvisoria',
         logo: 'https://github.com/mccoy88f/OMG-TV-Stremio-Addon/blob/main/tv.png?raw=true',
         resources: ['stream', 'catalog', 'meta'],
         types: ['tv'],
         idPrefixes: ['tv'],
         catalogs: [
+            // --- MODIFICA BOMBA: Catalogo "In Onda Ora" Aggiunto di Default ---
             {
                 type: 'tv',
-                id: 'omg_tv',
+                id: 'omg_tv_now_playing', // L'ID che il tuo handlers.js si aspetta
+                name: '📺 In Onda Ora',
+                extra: [] // Questo catalogo non ha filtri
+            },
+            // --- FINE MODIFICA BOMBA ---
+            {
+                type: 'tv',
+                id: 'omg_tv', // Il catalogo principale di base
                 name: 'OMG TV',
                 extra: [
                     {
                         name: 'genre',
                         isRequired: false,
-                        options: []  // Verrà popolato dinamicamente dai generi della playlist
+                        options: []  // Verrà popolato dinamicamente
                     },
                     {
                         name: 'search',
@@ -63,6 +71,14 @@ function loadCustomConfig() {
         if (addonConfigExists) {
             const customConfig = JSON.parse(fs.readFileSync(configOverridePath, 'utf8'));
             
+            // Definisci il tuo catalogo personalizzato (quello da addon-config.json)
+            const customCatalog = {
+                ...baseConfig.manifest.catalogs[1], // Prendi il template del catalogo principale
+                id: 'omg_plus_tv', // ID personalizzato
+                name: customConfig.addonName || 'OMG+ TV', // Nome personalizzato
+                extra: [ ...baseConfig.manifest.catalogs[1].extra ] // Stessi extra
+            };
+
             const mergedConfig = {
                 ...baseConfig,
                 defaultLanguage: customConfig.defaultLanguage || baseConfig.defaultLanguage,
@@ -77,26 +93,13 @@ function loadCustomConfig() {
                         configurationURL: null,  // Verrà impostato dinamicamente
                         reloadRequired: true
                     },
-                    catalogs: [{
-                        ...baseConfig.manifest.catalogs[0],
-                        id: addonConfigExists ? 'omg_plus_tv' : baseConfig.manifest.catalogs[0].id,
-                        name: addonConfigExists ? 'OMG+ TV' : baseConfig.manifest.catalogs[0].name,
-                        extra: [
-                            {
-                                name: 'genre',
-                                isRequired: false,
-                                options: []  // Verrà popolato dinamicamente dai generi della playlist
-                            },
-                            {
-                                name: 'search',
-                                isRequired: false
-                            },
-                            {
-                                name: 'skip',
-                                isRequired: false
-                            }
-                        ]
-                    }]
+                    // --- MODIFICA BOMBA: Unione Intelligente dei Cataloghi ---
+                    // Ora l'utente vedrà [Il tuo Addon] E [📺 In Onda Ora]
+                    catalogs: [
+                        customCatalog, // Il tuo catalogo personalizzato (es. "Zenith")
+                        ...baseConfig.manifest.catalogs // Tutti i cataloghi di base (incluso "In Onda Ora")
+                    ]
+                    // --- FINE MODIFICA BOMBA ---
                 }
             };
 
